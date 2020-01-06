@@ -216,7 +216,22 @@ impl Default for Timer {
     }
 }
 
+#[cfg(feature = "local")]
+thread_local! {
+    static HANDLE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+}
+#[cfg(not(feature = "local"))]
 static HANDLE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "local")]
+fn handle_fallback_load() -> usize {
+    HANDLE_FALLBACK.with(|h| h.load(SeqCst))
+}
+
+#[cfg(not(feature = "local"))]
+fn handle_fallback_load() -> usize {
+    HANDLE_FALLBACK.load(SeqCst)
+}
 
 /// Error returned from `TimerHandle::set_fallback`.
 #[derive(Clone, Debug)]
@@ -245,6 +260,20 @@ impl TimerHandle {
     /// thread otherwise loses a race to call this method then it will fail
     /// returning an error. Once a call to `set_as_global_fallback` is
     /// successful then no future calls may succeed.
+    #[cfg(feature = "local")]
+    fn set_as_global_fallback(self) -> Result<(), SetDefaultError> {
+        unsafe {
+            let val = self.into_usize();
+            HANDLE_FALLBACK.with(|h| match h.compare_exchange(0, val, SeqCst, SeqCst) {
+                Ok(_) => Ok(()),
+                Err(_) => {
+                    drop(TimerHandle::from_usize(val));
+                    Err(SetDefaultError(()))
+                }
+            })
+        }
+    }
+    #[cfg(not(feature = "local"))]
     fn set_as_global_fallback(self) -> Result<(), SetDefaultError> {
         unsafe {
             let val = self.into_usize();
@@ -270,7 +299,7 @@ impl TimerHandle {
 
 impl Default for TimerHandle {
     fn default() -> TimerHandle {
-        let mut fallback = HANDLE_FALLBACK.load(SeqCst);
+        let mut fallback = handle_fallback_load();
 
         // If the fallback hasn't been previously initialized then let's spin
         // up a helper thread and try to initialize with that. If we can't
@@ -295,7 +324,7 @@ impl Default for TimerHandle {
                 helper.forget();
                 return ret;
             }
-            fallback = HANDLE_FALLBACK.load(SeqCst);
+            fallback = handle_fallback_load();
         }
 
         // At this point our fallback handle global was configured so we use
